@@ -1,7 +1,7 @@
 mod status;
 
 use console::style;
-use rngo_sim::{Dialect, SqliteRunLog, spec};
+use rngo_sim::{Dialect, RunLog, SimulationEvent, SqliteRunLog, spec};
 use status::StatusRunLog;
 use std::collections::HashMap;
 use std::error::Error;
@@ -49,28 +49,31 @@ pub fn run(
         .iter()
         .filter_map(|(k, v)| v.channel.as_ref().map(|s| (k.clone(), s.clone())))
         .collect();
+
     let run_log = StatusRunLog::new(
         Box::new(SqliteRunLog::new(run_dir.clone(), simulation_builder.seed)),
         effect_channels,
     );
 
     let mut simulation = simulation_builder
-        .run_log(run_log)
+        .run_log_reader(run_log.reader())
         .build()
         .map_err(join_errors)?;
 
     let system_builder = dialect.parse_system(spec.clone()).map_err(join_errors)?;
 
-    let mut system = system_builder
-        .output_tx(simulation.output_tx())
-        .build()
-        .map_err(join_errors)?;
+    let mut system = system_builder.build().map_err(join_errors)?;
 
-    for input_event in &mut simulation {
+    for event in &mut simulation {
         if stdout {
-            println!("{}", serde_json::to_string(&input_event)?);
+            println!("{}", serde_json::to_string(&event)?);
         } else {
-            system.send(&input_event)?;
+            match event {
+                SimulationEvent::Input(input) => {
+                    system.send(&input)?;
+                }
+                SimulationEvent::SkippedInput(skipped_input) => todo!(),
+            }
         }
     }
 
@@ -80,7 +83,6 @@ pub fn run(
     // below see them too. The run log itself commits once `simulation` drops at the end of this
     // function.
     system.finish();
-    simulation.finish();
 
     let mut all_passed = true;
 

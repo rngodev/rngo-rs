@@ -1,12 +1,11 @@
 use crate::effect::Input;
 use crate::output::Level;
-use crate::run_log::{Cursor, RunLogIndex, RunLogIndexConfig, RunLogReader};
+use crate::run_log::{Cursor, EffectMetadata, RunLogIndex, RunLogIndexConfig, RunLogReader};
 use crate::schema::Metadata;
-use crate::signal::SignalOutcome;
+use crate::signal::sql_value_to_json;
 use crate::util::json_pointer::JsonPointer;
-use crate::{RunLog, RunLogEvent, spec};
+use crate::{Output, RunLog, spec};
 use chrono::{DateTime, Utc};
-use indexmap::IndexMap;
 use rand::RngExt;
 use rand_pcg::Pcg32;
 use rand_seeder::Seeder;
@@ -134,50 +133,72 @@ impl SqliteRunLog {
 }
 
 impl RunLog for SqliteRunLog {
-    fn push(&mut self, event: RunLogEvent) {
-        match &event {
-            RunLogEvent::Input(e) => {
-                self.connection
-                    .borrow()
-                    .prepare_cached(
-                        "INSERT INTO inputs (id, effect, offset, data) VALUES (?1, ?2, ?3, ?4)",
-                    )
-                    .unwrap()
-                    .execute(rusqlite::params![
-                        e.id as i64,
-                        e.effect,
-                        e.offset as i64,
-                        serde_json::to_string(&e.data).unwrap(),
-                    ])
-                    .unwrap();
+    fn push_input(&mut self, input: Input) {
+        self.connection
+            .borrow()
+            .prepare_cached("INSERT INTO inputs (id, effect, offset, data) VALUES (?1, ?2, ?3, ?4)")
+            .unwrap()
+            .execute(rusqlite::params![
+                input.id as i64,
+                input.effect,
+                input.offset as i64,
+                serde_json::to_string(&input.data).unwrap(),
+            ])
+            .unwrap();
 
-                self.insert_metadata(Some(e.id as i64), &e.effect, e.offset, &e.metadata);
-            }
-            RunLogEvent::Skipped(e) => {
-                self.insert_metadata(None, &e.effect, e.offset, &e.metadata);
-            }
-            RunLogEvent::Output(s) => {
-                self.connection
-                    .borrow()
-                    .prepare_cached(
-                        "INSERT INTO outputs (input_id, timestamp, channel, level, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    )
-                    .unwrap()
-                    .execute(rusqlite::params![
-                        s.input_id.map(|id| id as i64),
-                        s.timestamp.to_rfc3339(),
-                        s.channel,
-                        match s.level {
-                            Level::Error => "error",
-                            Level::Warning => "warning",
-                            Level::Info => "info",
-                        },
-                        s.data,
-                    ])
-                    .unwrap();
-            }
-        }
+        self.insert_metadata(
+            Some(input.id as i64),
+            &input.effect,
+            input.offset,
+            &input.metadata,
+        );
         self.record();
+    }
+
+    fn push_output(&mut self, output: Output) {
+        self.connection
+            .borrow()
+            .prepare_cached(
+                "INSERT INTO outputs (input_id, timestamp, channel, level, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .unwrap()
+            .execute(rusqlite::params![
+                output.input_id.map(|id| id as i64),
+                output.timestamp.to_rfc3339(),
+                output.channel,
+                match output.level {
+                    Level::Error => "error",
+                    Level::Warning => "warning",
+                    Level::Info => "info",
+                },
+                output.data,
+            ])
+            .unwrap();
+        self.record();
+    }
+
+    fn push_metadata(&mut self, metadata: EffectMetadata) {
+        self.insert_metadata(
+            metadata.input_id,
+            &metadata.effect,
+            metadata.offset,
+            &metadata.metadata,
+        );
+        self.record();
+    }
+
+    /// Queries the writer's own connection, so pending, uncommitted events from this run are
+    /// visible to signals without needing a prior commit (see the struct docs). Only the raw
+    /// query result is returned here - compiling/evaluating a signal's `expect` expression
+    /// against it is backend-agnostic and lives in `signal.rs`.
+    fn get_signal(&self, signal: spec::Signal) -> Option<serde_json::Value> {
+        let spec::Signal::Sql { query, .. } = signal;
+
+        self.connection
+            .borrow()
+            .query_row(&query, [], |row| row.get::<_, rusqlite::types::Value>(0))
+            .ok()
+            .and_then(sql_value_to_json)
     }
 
     fn reader(&self) -> Rc<dyn RunLogReader> {
@@ -186,18 +207,6 @@ impl RunLog for SqliteRunLog {
             rng: Rc::clone(&self.rng),
             next_segment: Rc::clone(&self.next_segment),
         })
-    }
-
-    /// Queries the writer's own connection, so pending, uncommitted events from this run are
-    /// visible to signals without needing a prior commit (see the struct docs).
-    fn evaluate_signals(
-        &self,
-        signals: &IndexMap<String, spec::Signal>,
-    ) -> IndexMap<String, SignalOutcome> {
-        let connection = self.connection.borrow();
-        let outcomes = crate::signal::evaluate(&connection, signals);
-        crate::signal::write_outcomes(&connection, &outcomes);
-        outcomes
     }
 }
 
@@ -236,6 +245,148 @@ fn metadata_for_input(connection: &Connection, input_id: i64) -> Vec<Metadata> {
         .collect()
 }
 
+/// Shared by [`RunLogReader::last`] and [`RunLog::last_input`] - both just want the most recently
+/// inserted input, visible to the writer's own pending, uncommitted rows.
+fn query_last(connection: &Connection) -> Option<Rc<Input>> {
+    let row = connection
+        .prepare_cached("SELECT id, effect, offset, data FROM inputs ORDER BY id DESC LIMIT 1")
+        .unwrap()
+        .query_row([], |row| {
+            let id: i64 = row.get(0)?;
+            let effect: String = row.get(1)?;
+            let offset: i64 = row.get(2)?;
+            let data: String = row.get(3)?;
+            Ok((id, effect, offset, data))
+        })
+        .optional()
+        .unwrap()?;
+
+    let (id, effect, offset, data) = row;
+    let metadata = metadata_for_input(connection, id);
+
+    Some(Rc::new(Input {
+        id: id as u64,
+        effect,
+        offset: offset as u64,
+        timestamp: placeholder_timestamp(),
+        data: serde_json::from_str(&data).unwrap(),
+        metadata,
+    }))
+}
+
+/// Shared by [`RunLogIndex::sample`] and [`RunLog::sample_input`] - `segment` scopes
+/// `Cursor::Unique`'s "already returned" bookkeeping and must already be reserved by the caller.
+fn query_sample(
+    connection: &Connection,
+    rng: &RefCell<Pcg32>,
+    segment: Option<&str>,
+    config: &RunLogIndexConfig,
+) -> Option<Rc<Input>> {
+    let RunLogIndexConfig::ByEffect { key, cursor } = config;
+
+    let row = match cursor {
+        Cursor::Last => connection
+            .prepare_cached(
+                "SELECT id, offset, data FROM inputs WHERE effect = ?1 ORDER BY id DESC LIMIT 1",
+            )
+            .unwrap()
+            .query_row(rusqlite::params![key], |row| {
+                let id: i64 = row.get(0)?;
+                let offset: i64 = row.get(1)?;
+                let data: String = row.get(2)?;
+                Ok((id, offset, data))
+            })
+            .optional()
+            .unwrap(),
+        Cursor::Random => {
+            let count: i64 = connection
+                .prepare_cached("SELECT COUNT(*) FROM inputs WHERE effect = ?1")
+                .unwrap()
+                .query_row(rusqlite::params![key], |row| row.get(0))
+                .unwrap();
+
+            if count == 0 {
+                None
+            } else {
+                let offset_index = rng.borrow_mut().random_range(0..count);
+                connection
+                    .prepare_cached(
+                        "SELECT id, offset, data FROM inputs WHERE effect = ?1 ORDER BY id ASC LIMIT 1 OFFSET ?2",
+                    )
+                    .unwrap()
+                    .query_row(rusqlite::params![key, offset_index], |row| {
+                        let id: i64 = row.get(0)?;
+                        let offset: i64 = row.get(1)?;
+                        let data: String = row.get(2)?;
+                        Ok((id, offset, data))
+                    })
+                    .optional()
+                    .unwrap()
+            }
+        }
+        Cursor::Unique => {
+            let segment = segment.expect("segment set for Cursor::Unique");
+
+            let count: i64 = connection
+                .prepare_cached(
+                    "SELECT COUNT(*) FROM inputs i WHERE i.effect = ?1 AND NOT EXISTS (
+                        SELECT 1 FROM metadata m
+                        WHERE m.type = '_unique_reference' AND m.segment = ?2 AND m.input_id = i.id
+                    )",
+                )
+                .unwrap()
+                .query_row(rusqlite::params![key, segment], |row| row.get(0))
+                .unwrap();
+
+            if count == 0 {
+                None
+            } else {
+                let offset_index = rng.borrow_mut().random_range(0..count);
+                let row = connection
+                    .prepare_cached(
+                        "SELECT i.id, i.offset, i.data FROM inputs i WHERE i.effect = ?1 AND NOT EXISTS (
+                            SELECT 1 FROM metadata m
+                            WHERE m.type = '_unique_reference' AND m.segment = ?2 AND m.input_id = i.id
+                        ) ORDER BY i.id ASC LIMIT 1 OFFSET ?3",
+                    )
+                    .unwrap()
+                    .query_row(rusqlite::params![key, segment, offset_index], |row| {
+                        let id: i64 = row.get(0)?;
+                        let offset: i64 = row.get(1)?;
+                        let data: String = row.get(2)?;
+                        Ok((id, offset, data))
+                    })
+                    .optional()
+                    .unwrap();
+
+                if let Some((id, offset, _)) = &row {
+                    connection
+                        .prepare_cached(
+                            "INSERT INTO metadata (type, input_id, effect, offset, segment) VALUES ('_unique_reference', ?1, ?2, ?3, ?4)",
+                        )
+                        .unwrap()
+                        .execute(rusqlite::params![id, key, offset, segment])
+                        .unwrap();
+                }
+
+                row
+            }
+        }
+    }?;
+
+    let (id, offset, data) = row;
+    let metadata = metadata_for_input(connection, id);
+
+    Some(Rc::new(Input {
+        id: id as u64,
+        effect: key.clone(),
+        offset: offset as u64,
+        timestamp: placeholder_timestamp(),
+        data: serde_json::from_str(&data).unwrap(),
+        metadata,
+    }))
+}
+
 #[derive(Debug)]
 struct SqliteRunLogReader {
     connection: Rc<RefCell<Connection>>,
@@ -245,31 +396,7 @@ struct SqliteRunLogReader {
 
 impl RunLogReader for SqliteRunLogReader {
     fn last(&self) -> Option<Rc<Input>> {
-        let connection = self.connection.borrow();
-        let row = connection
-            .prepare_cached("SELECT id, effect, offset, data FROM inputs ORDER BY id DESC LIMIT 1")
-            .unwrap()
-            .query_row([], |row| {
-                let id: i64 = row.get(0)?;
-                let effect: String = row.get(1)?;
-                let offset: i64 = row.get(2)?;
-                let data: String = row.get(3)?;
-                Ok((id, effect, offset, data))
-            })
-            .optional()
-            .unwrap()?;
-
-        let (id, effect, offset, data) = row;
-        let metadata = metadata_for_input(&connection, id);
-
-        Some(Rc::new(Input {
-            id: id as u64,
-            effect,
-            offset: offset as u64,
-            timestamp: placeholder_timestamp(),
-            data: serde_json::from_str(&data).unwrap(),
-            metadata,
-        }))
+        query_last(&self.connection.borrow())
     }
 
     fn index(&self, config: RunLogIndexConfig) -> Box<dyn RunLogIndex> {
@@ -301,118 +428,19 @@ struct SqliteRunLogIndex {
 
 impl RunLogIndex for SqliteRunLogIndex {
     fn sample(&self) -> Option<Rc<Input>> {
-        let connection = self.connection.borrow();
-
-        let RunLogIndexConfig::ByEffect { key, cursor } = &self.config;
-
-        let row = match cursor {
-            Cursor::Last => connection
-                .prepare_cached(
-                    "SELECT id, offset, data FROM inputs WHERE effect = ?1 ORDER BY id DESC LIMIT 1",
-                )
-                .unwrap()
-                .query_row(rusqlite::params![key], |row| {
-                    let id: i64 = row.get(0)?;
-                    let offset: i64 = row.get(1)?;
-                    let data: String = row.get(2)?;
-                    Ok((id, offset, data))
-                })
-                .optional()
-                .unwrap(),
-            Cursor::Random => {
-                let count: i64 = connection
-                    .prepare_cached("SELECT COUNT(*) FROM inputs WHERE effect = ?1")
-                    .unwrap()
-                    .query_row(rusqlite::params![key], |row| row.get(0))
-                    .unwrap();
-
-                if count == 0 {
-                    None
-                } else {
-                    let offset_index = self.rng.borrow_mut().random_range(0..count);
-                    connection
-                        .prepare_cached(
-                            "SELECT id, offset, data FROM inputs WHERE effect = ?1 ORDER BY id ASC LIMIT 1 OFFSET ?2",
-                        )
-                        .unwrap()
-                        .query_row(rusqlite::params![key, offset_index], |row| {
-                            let id: i64 = row.get(0)?;
-                            let offset: i64 = row.get(1)?;
-                            let data: String = row.get(2)?;
-                            Ok((id, offset, data))
-                        })
-                        .optional()
-                        .unwrap()
-                }
-            }
-            Cursor::Unique => {
-                let segment = self.segment.as_deref().expect("segment set for Cursor::Unique");
-
-                let count: i64 = connection
-                    .prepare_cached(
-                        "SELECT COUNT(*) FROM inputs i WHERE i.effect = ?1 AND NOT EXISTS (
-                            SELECT 1 FROM metadata m
-                            WHERE m.type = '_unique_reference' AND m.segment = ?2 AND m.input_id = i.id
-                        )",
-                    )
-                    .unwrap()
-                    .query_row(rusqlite::params![key, segment], |row| row.get(0))
-                    .unwrap();
-
-                if count == 0 {
-                    None
-                } else {
-                    let offset_index = self.rng.borrow_mut().random_range(0..count);
-                    let row = connection
-                        .prepare_cached(
-                            "SELECT i.id, i.offset, i.data FROM inputs i WHERE i.effect = ?1 AND NOT EXISTS (
-                                SELECT 1 FROM metadata m
-                                WHERE m.type = '_unique_reference' AND m.segment = ?2 AND m.input_id = i.id
-                            ) ORDER BY i.id ASC LIMIT 1 OFFSET ?3",
-                        )
-                        .unwrap()
-                        .query_row(rusqlite::params![key, segment, offset_index], |row| {
-                            let id: i64 = row.get(0)?;
-                            let offset: i64 = row.get(1)?;
-                            let data: String = row.get(2)?;
-                            Ok((id, offset, data))
-                        })
-                        .optional()
-                        .unwrap();
-
-                    if let Some((id, offset, _)) = &row {
-                        connection
-                            .prepare_cached(
-                                "INSERT INTO metadata (type, input_id, effect, offset, segment) VALUES ('_unique_reference', ?1, ?2, ?3, ?4)",
-                            )
-                            .unwrap()
-                            .execute(rusqlite::params![id, key, offset, segment])
-                            .unwrap();
-                    }
-
-                    row
-                }
-            }
-        }?;
-
-        let (id, offset, data) = row;
-        let metadata = metadata_for_input(&connection, id);
-
-        Some(Rc::new(Input {
-            id: id as u64,
-            effect: key.clone(),
-            offset: offset as u64,
-            timestamp: placeholder_timestamp(),
-            data: serde_json::from_str(&data).unwrap(),
-            metadata,
-        }))
+        query_sample(
+            &self.connection.borrow(),
+            &self.rng,
+            self.segment.as_deref(),
+            &self.config,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::{Input, SkippedInput};
+    use crate::effect::Input;
     use chrono::Utc;
     use tempfile::TempDir;
 
@@ -425,7 +453,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
 
-        run_log.push(RunLogEvent::Input(Input {
+        run_log.push_input(Input {
             id: 1,
             effect: "ping".to_string(),
             offset: 42,
@@ -436,14 +464,14 @@ mod tests {
                 attribute: None,
                 data: Some(serde_json::json!({ "message": "partial value" })),
             }],
-        }));
-        run_log.push(RunLogEvent::Output(crate::output::Output {
+        });
+        run_log.push_output(Output {
             input_id: Some(1),
             timestamp: Utc::now(),
             channel: "logger".to_string(),
             level: Level::Info,
             data: "hello".to_string(),
-        }));
+        });
 
         // Force the pending transaction closed so the rows are visible to a fresh connection.
         run_log.commit();
@@ -496,16 +524,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
 
-        run_log.push(RunLogEvent::Skipped(SkippedInput {
+        run_log.push_metadata(EffectMetadata {
+            input_id: None,
             effect: "ping".to_string(),
             offset: 42,
-            timestamp: Utc::now().fixed_offset(),
             metadata: vec![Metadata {
                 mtype: "skipped".into(),
                 attribute: None,
                 data: None,
             }],
-        }));
+        });
 
         run_log.commit();
 
@@ -550,14 +578,14 @@ mod tests {
         let mut run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
 
         for i in 0..(BATCH_SIZE * 2 + 3) {
-            run_log.push(RunLogEvent::Input(Input {
+            run_log.push_input(Input {
                 id: (i + 1) as u64,
                 effect: "ping".to_string(),
                 offset: i as u64,
                 timestamp: Utc::now().fixed_offset(),
                 data: serde_json::json!(i),
                 metadata: vec![],
-            }));
+            });
         }
         run_log.commit();
 
@@ -582,27 +610,27 @@ mod tests {
         let mut run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
         let reader = run_log.reader();
 
-        run_log.push(RunLogEvent::Input(Input {
+        run_log.push_input(Input {
             id: 1,
             effect: "ping".to_string(),
             offset: 0,
             timestamp: Utc::now().fixed_offset(),
             data: serde_json::json!(1),
             metadata: vec![],
-        }));
+        });
         // Not committed yet - the reader must still see it, since it shares the writer's
         // connection and effect.rs computes ids mid-batch.
         let last = reader.last().unwrap();
         assert_eq!(last.id, 1);
 
-        run_log.push(RunLogEvent::Input(Input {
+        run_log.push_input(Input {
             id: 2,
             effect: "ping".to_string(),
             offset: 1,
             timestamp: Utc::now().fixed_offset(),
             data: serde_json::json!(2),
             metadata: vec![],
-        }));
+        });
         let last = reader.last().unwrap();
         assert_eq!(last.id, 2);
         assert_eq!(last.data, serde_json::json!(2));
@@ -615,14 +643,14 @@ mod tests {
         let reader = run_log.reader();
 
         for (i, effect) in [(1, "a"), (2, "b"), (3, "a")] {
-            run_log.push(RunLogEvent::Input(Input {
+            run_log.push_input(Input {
                 id: i,
                 effect: effect.to_string(),
                 offset: i,
                 timestamp: Utc::now().fixed_offset(),
                 data: serde_json::json!(i),
                 metadata: vec![],
-            }));
+            });
         }
 
         let index = reader.index(RunLogIndexConfig::ByEffect {
@@ -641,14 +669,14 @@ mod tests {
         let reader = run_log.reader();
 
         for i in 1..=10u64 {
-            run_log.push(RunLogEvent::Input(Input {
+            run_log.push_input(Input {
                 id: i,
                 effect: "a".to_string(),
                 offset: i,
                 timestamp: Utc::now().fixed_offset(),
                 data: serde_json::json!(i),
                 metadata: vec![],
-            }));
+            });
         }
 
         let index = reader.index(RunLogIndexConfig::ByEffect {
@@ -684,14 +712,14 @@ mod tests {
 
     fn push_inputs(run_log: &mut SqliteRunLog, effect: &str, count: u64) {
         for i in 1..=count {
-            run_log.push(RunLogEvent::Input(Input {
+            run_log.push_input(Input {
                 id: i,
                 effect: effect.to_string(),
                 offset: i,
                 timestamp: Utc::now().fixed_offset(),
                 data: serde_json::json!(i),
                 metadata: vec![],
-            }));
+            });
         }
     }
 
@@ -775,5 +803,33 @@ mod tests {
 
         let last = reader.last().unwrap();
         assert!(last.metadata.is_empty());
+    }
+
+    #[test]
+    fn get_signal_returns_query_value() {
+        let tmp = TempDir::new().unwrap();
+        let mut run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
+        push_inputs(&mut run_log, "a", 3);
+        run_log.commit();
+
+        let value = run_log.get_signal(spec::Signal::Sql {
+            query: "SELECT COUNT(*) FROM inputs".to_string(),
+            expect: None,
+        });
+
+        assert_eq!(value, Some(serde_json::json!(3)));
+    }
+
+    #[test]
+    fn get_signal_returns_none_on_query_error() {
+        let tmp = TempDir::new().unwrap();
+        let run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
+
+        let value = run_log.get_signal(spec::Signal::Sql {
+            query: "SELECT COUNT(*) FROM missing_table".to_string(),
+            expect: None,
+        });
+
+        assert_eq!(value, None);
     }
 }

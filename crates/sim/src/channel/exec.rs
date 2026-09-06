@@ -10,7 +10,6 @@ use std::sync::mpsc::Sender;
 #[derive(Debug)]
 pub struct Exec {
     channel_key: String,
-    output_tx: Sender<Output>,
     hbs: Handlebars<'static>,
 }
 
@@ -25,7 +24,7 @@ impl ChannelTarget for Exec {
         &mut self,
         input: &Input,
         _data: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Output>, Box<dyn std::error::Error>> {
         let command = self.hbs.render("command", &input.data)?;
 
         let output = Command::new("sh")
@@ -36,6 +35,8 @@ impl ChannelTarget for Exec {
             .output()?;
 
         let timestamp = Utc::now();
+        let mut outputs = vec![];
+
         for (bytes, level) in [
             (&output.stdout, Level::Info),
             (&output.stderr, Level::Error),
@@ -45,7 +46,7 @@ impl ChannelTarget for Exec {
                 .map_while(Result::ok)
             {
                 if !line.is_empty() {
-                    let _ = self.output_tx.send(Output {
+                    outputs.push(Output {
                         input_id: Some(input.id),
                         channel: self.channel_key.clone(),
                         level,
@@ -57,7 +58,7 @@ impl ChannelTarget for Exec {
         }
 
         if !output.status.success() {
-            let _ = self.output_tx.send(Output {
+            outputs.push(Output {
                 input_id: Some(input.id),
                 channel: self.channel_key.clone(),
                 level: Level::Error,
@@ -66,7 +67,7 @@ impl ChannelTarget for Exec {
             });
         }
 
-        Ok(())
+        Ok(outputs)
     }
 }
 
@@ -95,7 +96,7 @@ impl ExecBuilder {
 }
 
 impl ChannelTargetBuilder for ExecBuilder {
-    fn build(&self, output_tx: Sender<Output>) -> Result<Box<dyn ChannelTarget>, Vec<BuildError>> {
+    fn build(&self, _output_tx: Sender<Output>) -> Result<Box<dyn ChannelTarget>, Vec<BuildError>> {
         let Some(command) = self.command.clone() else {
             return Err(vec![BuildError::ChannelTarget {
                 channel: self.channel_key.clone(),
@@ -114,7 +115,6 @@ impl ChannelTargetBuilder for ExecBuilder {
 
         Ok(Box::new(Exec {
             channel_key: self.channel_key.clone(),
-            output_tx,
             hbs,
         }))
     }

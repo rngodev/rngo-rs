@@ -35,15 +35,17 @@ impl ChannelTarget for Stream {
         &mut self,
         input: &Input,
         data: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Output>, Box<dyn std::error::Error>> {
         let Some(stdin) = self.stdin.as_mut() else {
-            return Ok(());
+            return Ok(vec![]);
         };
 
         let data = data.unwrap_or_else(|| serde_json::to_string(&input.data).unwrap());
         writeln!(stdin, "{data}").map_err(|e| format!("channel '{}': {e}", self.channel_key))?;
 
-        Ok(())
+        // The subprocess's reaction, if any, arrives later on its own schedule via the reader
+        // threads below, not synchronously here.
+        Ok(vec![])
     }
 }
 

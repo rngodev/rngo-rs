@@ -24,7 +24,7 @@ impl Channel {
 }
 
 pub trait ChannelTarget: std::fmt::Debug {
-    fn send(&mut self, input: &Input, data: Option<String>) -> Result<(), Box<dyn Error>>;
+    fn send(&mut self, input: &Input, data: Option<String>) -> Result<Vec<Output>, Box<dyn Error>>;
 }
 
 pub trait ChannelTargetBuilder {

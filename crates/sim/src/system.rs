@@ -1,11 +1,12 @@
 use crate::channel::ChannelBuilder;
 use crate::{BuildError, Channel, Input, Output};
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver};
 
 pub struct System {
     pub channels: HashMap<String, Channel>,
     pub effect_channels: HashMap<String, String>,
+    output_rx: Receiver<Output>,
 }
 
 impl System {
@@ -13,10 +14,15 @@ impl System {
         SystemBuilder::new()
     }
 
-    pub fn send(&mut self, input: &Input) -> Result<(), Box<dyn std::error::Error>> {
+    /// Sends `input` to whichever channel its effect is assigned to, if any, returning any
+    /// outputs the channel target produced synchronously in direct response (e.g. an `exec`
+    /// target's captured stdout/stderr). Outputs a target produces on its own schedule (e.g. a
+    /// `stream` target's subprocess writing to stdout at some later point) are not returned here
+    /// - drain them from `System` itself, which implements `Iterator<Item = Output>`.
+    pub fn send(&mut self, input: &Input) -> Result<Vec<Output>, Box<dyn std::error::Error>> {
         let channel_key = match self.effect_channels.get(&input.effect) {
             Some(k) => k.clone(),
-            None => return Ok(()),
+            None => return Ok(vec![]),
         };
 
         match self.channels.get_mut(&channel_key) {
@@ -29,36 +35,37 @@ impl System {
 
                 channel.target.send(input, formatted_data)
             }
-            None => Ok(()),
+            None => Ok(vec![]),
         }
     }
 
-    pub fn finish(self) {
-        drop(self.channels);
+    /// Shuts down every channel's target (e.g. closing a `stream` subprocess's stdin and
+    /// waiting for it to exit). This can itself produce trailing outputs, so `System` remains
+    /// iterable afterward - drain it before dropping to pick those up.
+    pub fn finish(&mut self) {
+        self.channels.clear();
+    }
+}
+
+/// Yields outputs a channel target has produced on its own schedule (e.g. a `stream` target's
+/// subprocess writing to stdout), as opposed to the outputs `send` returns directly.
+impl Iterator for System {
+    type Item = Output;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.output_rx.try_recv().ok()
     }
 }
 
 pub struct SystemBuilder {
-    output_tx: Option<Sender<Output>>,
     channel_builders: Vec<ChannelBuilder>,
 }
 
 impl SystemBuilder {
     pub fn new() -> Self {
         Self {
-            output_tx: None,
             channel_builders: vec![],
         }
-    }
-
-    pub fn output_tx(mut self, output_tx: Sender<Output>) -> Self {
-        self.set_output_tx(output_tx);
-        self
-    }
-
-    pub fn set_output_tx(&mut self, output_tx: Sender<Output>) -> &mut Self {
-        self.output_tx = Some(output_tx);
-        self
     }
 
     pub fn set_channel(&mut self, channel: ChannelBuilder) {
@@ -79,22 +86,21 @@ impl SystemBuilder {
     pub fn build(self) -> Result<System, Vec<BuildError>> {
         let mut errors = vec![];
         let mut channels = HashMap::new();
+        let (output_tx, output_rx) = mpsc::channel::<Output>();
 
-        if let Some(output_tx) = self.output_tx {
-            for mut channel_builder in self.channel_builders {
-                channel_builder.set_output_tx(output_tx.clone());
+        for mut channel_builder in self.channel_builders {
+            channel_builder.set_output_tx(output_tx.clone());
 
-                match channel_builder.build() {
-                    Ok(channel) => {
-                        channels.insert(channel.key.clone(), channel);
-                    }
-                    Err(mut e) => errors.append(&mut e),
-                };
-            }
-        } else {
-            errors.push(BuildError::System {
-                message: "output_tx was not set".into(),
-            });
+            match channel_builder.build() {
+                Ok(channel) => {
+                    channels.insert(channel.key.clone(), channel);
+                }
+                Err(mut e) => errors.append(&mut e),
+            };
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
         }
 
         let effect_channels = channels
@@ -110,6 +116,13 @@ impl SystemBuilder {
         Ok(System {
             channels,
             effect_channels,
+            output_rx,
         })
+    }
+}
+
+impl Default for SystemBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }

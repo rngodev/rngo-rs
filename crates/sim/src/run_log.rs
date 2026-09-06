@@ -1,50 +1,21 @@
 mod simple;
 mod sqlite;
 
-use crate::effect::{Input, SkippedInput};
-use crate::signal::SignalOutcome;
+use crate::effect::Input;
+use crate::schema::Metadata;
 use crate::{Output, spec};
-use indexmap::IndexMap;
+use serde_json::Value;
 use std::rc::Rc;
 
 pub use simple::SimpleEventRunLog;
 pub use sqlite::SqliteRunLog;
 
 pub trait RunLog: std::fmt::Debug {
-    fn push(&mut self, event: RunLogEvent);
+    fn push_input(&mut self, input: Input);
+    fn push_output(&mut self, output: Output);
+    fn push_metadata(&mut self, metadata: EffectMetadata);
+    fn get_signal(&self, signal: spec::Signal) -> Option<Value>;
     fn reader(&self) -> Rc<dyn RunLogReader>;
-
-    /// Evaluates `signals` against this run log's recorded events, returning one outcome per
-    /// signal keyed the same way. A backend with no query engine over its events (e.g.
-    /// [`SimpleEventRunLog`]) reports every signal as unsupported rather than failing outright.
-    fn evaluate_signals(
-        &self,
-        signals: &IndexMap<String, spec::Signal>,
-    ) -> IndexMap<String, SignalOutcome>;
-}
-
-pub enum RunLogEvent {
-    Input(Input),
-    Skipped(SkippedInput),
-    Output(Output),
-}
-
-impl From<Input> for RunLogEvent {
-    fn from(e: Input) -> Self {
-        RunLogEvent::Input(e)
-    }
-}
-
-impl From<SkippedInput> for RunLogEvent {
-    fn from(e: SkippedInput) -> Self {
-        RunLogEvent::Skipped(e)
-    }
-}
-
-impl From<Output> for RunLogEvent {
-    fn from(s: Output) -> Self {
-        RunLogEvent::Output(s)
-    }
 }
 
 pub trait RunLogReader: std::fmt::Debug {
@@ -61,15 +32,17 @@ pub enum RunLogIndexConfig {
     ByEffect { key: String, cursor: Cursor },
 }
 
-/// How a [`RunLogIndex`] picks which of an effect's prior inputs to return from
-/// [`RunLogIndex::sample`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cursor {
-    /// Always the most recently emitted matching input (used by trigger-by-effect).
     Last,
-    /// Any matching input, possibly repeating ones already returned (the `reference` schema's
-    /// default).
     Random,
-    /// Any matching input not yet returned by this index; `None` once exhausted.
     Unique,
+}
+
+#[derive(Clone, Debug)]
+pub struct EffectMetadata {
+    input_id: Option<i64>,
+    effect: String,
+    offset: u64,
+    metadata: Vec<Metadata>,
 }

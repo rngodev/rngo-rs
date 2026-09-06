@@ -1,8 +1,6 @@
 use chrono::{DateTime, FixedOffset};
 use console::{Term, style};
-use indexmap::IndexMap;
-use rngo_sim::signal::SignalOutcome;
-use rngo_sim::{RunLog, RunLogEvent, RunLogReader, spec};
+use rngo_sim::{EffectMetadata, Input, Output, RunLog, RunLogReader, spec};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -87,33 +85,37 @@ impl std::fmt::Debug for StatusRunLog {
 }
 
 impl RunLog for StatusRunLog {
-    fn push(&mut self, event: RunLogEvent) {
-        match &event {
-            RunLogEvent::Input(e) => {
-                self.last_timestamp = Some(e.timestamp);
-                if let Some(channel) = self.effect_channels.get(&e.effect) {
-                    self.stats.entry(channel.clone()).or_default().effects += 1;
-                }
-            }
-            RunLogEvent::Output(s) => {
-                self.stats.entry(s.channel.clone()).or_default().outputs += 1;
-            }
-            RunLogEvent::Skipped(_) => {}
+    fn push_input(&mut self, input: Input) {
+        self.last_timestamp = Some(input.timestamp);
+        if let Some(channel) = self.effect_channels.get(&input.effect) {
+            self.stats.entry(channel.clone()).or_default().effects += 1;
         }
 
         self.render(false);
-        self.child.push(event);
+        self.child.push_input(input);
+    }
+
+    fn push_output(&mut self, output: Output) {
+        self.stats
+            .entry(output.channel.clone())
+            .or_default()
+            .outputs += 1;
+
+        self.render(false);
+        self.child.push_output(output);
+    }
+
+    fn push_metadata(&mut self, metadata: EffectMetadata) {
+        self.render(false);
+        self.child.push_metadata(metadata);
+    }
+
+    fn get_signal(&self, signal: spec::Signal) -> Option<serde_json::Value> {
+        self.child.get_signal(signal)
     }
 
     fn reader(&self) -> Rc<dyn RunLogReader> {
         self.child.reader()
-    }
-
-    fn evaluate_signals(
-        &self,
-        signals: &IndexMap<String, spec::Signal>,
-    ) -> IndexMap<String, SignalOutcome> {
-        self.child.evaluate_signals(signals)
     }
 }
 

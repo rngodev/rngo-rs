@@ -154,7 +154,7 @@ fn evaluate_one(connection: &Connection, key: &str, signal: &spec::Signal) -> Si
     }
 }
 
-fn sql_value_to_json(value: SqlValue) -> Option<serde_json::Value> {
+pub(crate) fn sql_value_to_json(value: SqlValue) -> Option<serde_json::Value> {
     Some(match value {
         SqlValue::Null => serde_json::Value::Null,
         SqlValue::Integer(i) => serde_json::Value::from(i),
