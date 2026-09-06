@@ -16,6 +16,14 @@ use std::time::{Duration, Instant};
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// How long to wait for a reader thread to notice its subprocess's stdout/stderr pipe has closed
+/// and exit, after the subprocess itself has already been killed and reaped above. Normally
+/// near-instant, since killing the child closes its pipes - but if the command forked a
+/// grandchild that inherited a pipe and outlived the kill, the reader thread's blocking read
+/// never returns. Rather than hang the whole run on that, the thread is abandoned once this
+/// deadline passes instead of joined.
+const READER_JOIN_GRACE: Duration = Duration::from_millis(200);
+
 #[derive(Debug)]
 pub struct Stream {
     channel_key: String,
@@ -53,7 +61,8 @@ impl Drop for Stream {
     /// Closes stdin, which triggers exit for subprocesses that react to EOF (e.g. `cat`), then
     /// gives the child a grace period before killing it - covering output-source subprocesses
     /// (e.g. `tail -F`) that never exit on their own. Reader threads are joined last so trailing
-    /// output has already become an `Output` before this returns.
+    /// output has already become an `Output` before this returns - bounded by `READER_JOIN_GRACE`
+    /// so a reader thread stuck on a pipe the kill above didn't actually close can't hang the run.
     fn drop(&mut self) {
         self.stdin.take();
 
@@ -68,8 +77,16 @@ impl Drop for Stream {
         let _ = self.child.kill();
         let _ = self.child.wait();
 
+        let deadline = Instant::now() + READER_JOIN_GRACE;
         for handle in self.reader_threads.drain(..) {
-            let _ = handle.join();
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(SHUTDOWN_POLL_INTERVAL);
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+            // Still running past the deadline: abandon it rather than block forever - it's
+            // leaked, but that's a far better failure mode for a CLI than hanging indefinitely.
         }
     }
 }
@@ -203,5 +220,33 @@ impl ChannelTargetParser for StreamParser {
         Ok(Box::new(
             StreamBuilder::new(channel_key).command(command.into()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn drop_abandons_a_reader_thread_stuck_on_an_orphaned_grandchild() {
+        let (tx, _rx) = mpsc::channel();
+        let stream = StreamBuilder::new("test".into())
+            // Backgrounds `sleep 5` without redirecting it, so it inherits this shell's stdout
+            // pipe and keeps it open (reparented, once this shell exits) well past both grace
+            // periods below - simulating a command whose kill doesn't actually close its pipe.
+            .command("sleep 5 & echo done".to_string())
+            .build(tx)
+            .unwrap();
+
+        let start = Instant::now();
+        drop(stream);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "drop should abandon a reader thread stuck on an orphaned pipe rather than block \
+             on it for the grandchild's full lifetime, took {elapsed:?}"
+        );
     }
 }

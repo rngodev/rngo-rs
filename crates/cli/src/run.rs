@@ -79,14 +79,21 @@ pub fn run(
                 SimulationEvent::SkippedInput(_skipped_input) => todo!(),
             }
         }
+
+        // `system` buffers ambient output (e.g. a `stream` channel's subprocess writing to
+        // stdout on its own schedule) in an unbounded channel behind the scenes - drain it every
+        // time we pull an event from `simulation` rather than only once at the end, so it can't
+        // build up across a long run. `System::next` is a non-blocking poll (`try_recv`), so this
+        // never waits on anything; it just keeps the buffer near-empty.
+        for output in &mut system {
+            run_log.push_output(output);
+        }
     }
 
     // Closes stdin on every stream channel (triggering exit for those that react to EOF) and
     // kills any stragglers - including output-source channels with no natural end - after a
-    // grace period. `system` remains iterable afterward for exactly this reason: outputs
-    // produced on a channel's own schedule (e.g. a `stream` subprocess flushing once it gets
-    // EOF, or an effect-less channel that only ever produces ambient output) never came back
-    // from `send`, so they're drained here instead, before signals below evaluate the run log.
+    // grace period. This can itself produce trailing output (e.g. a subprocess flushing once it
+    // gets EOF) after the last drain above, so drain once more before signals evaluate the log.
     system.finish();
     for output in &mut system {
         run_log.push_output(output);
