@@ -1,7 +1,7 @@
 mod status;
 
 use console::style;
-use rngo_sim::{Dialect, RunLog, SimulationEvent, SqliteRunLog, spec};
+use rngo_sim::{Dialect, RunLog, SimulationEvent, SqliteRunLog, signal, spec};
 use status::StatusRunLog;
 use std::collections::HashMap;
 use std::error::Error;
@@ -50,7 +50,7 @@ pub fn run(
         .filter_map(|(k, v)| v.channel.as_ref().map(|s| (k.clone(), s.clone())))
         .collect();
 
-    let run_log = StatusRunLog::new(
+    let mut run_log = StatusRunLog::new(
         Box::new(SqliteRunLog::new(run_dir.clone(), simulation_builder.seed)),
         effect_channels,
     );
@@ -70,24 +70,32 @@ pub fn run(
         } else {
             match event {
                 SimulationEvent::Input(input) => {
-                    system.send(&input)?;
+                    let outputs = system.send(&input)?;
+                    run_log.push_input(input);
+                    for output in outputs {
+                        run_log.push_output(output);
+                    }
                 }
-                SimulationEvent::SkippedInput(skipped_input) => todo!(),
+                SimulationEvent::SkippedInput(_skipped_input) => todo!(),
             }
         }
     }
 
     // Closes stdin on every stream channel (triggering exit for those that react to EOF) and
     // kills any stragglers - including output-source channels with no natural end - after a
-    // grace period; `simulation.finish()` drains the trailing outputs this produces so signals
-    // below see them too. The run log itself commits once `simulation` drops at the end of this
-    // function.
+    // grace period. `system` remains iterable afterward for exactly this reason: outputs
+    // produced on a channel's own schedule (e.g. a `stream` subprocess flushing once it gets
+    // EOF, or an effect-less channel that only ever produces ambient output) never came back
+    // from `send`, so they're drained here instead, before signals below evaluate the run log.
     system.finish();
+    for output in &mut system {
+        run_log.push_output(output);
+    }
 
     let mut all_passed = true;
 
     if !spec.signals.is_empty() {
-        let outcomes = simulation.evaluate_signals(&spec.signals);
+        let outcomes = signal::evaluate(&mut run_log, &spec.signals);
 
         println!();
         println!("{}", style("Audit").bold());

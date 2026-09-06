@@ -36,10 +36,6 @@ pub struct SimpleEventRunLog {
     inputs: Rc<RefCell<Vec<Rc<Input>>>>,
     outputs: Vec<Output>,
     metadata: Vec<EffectMetadata>,
-    /// Dedup state for [`Self::sample_input`]'s `Cursor::Unique`, shared across every call on
-    /// this log - unlike [`RunLogIndex`], `sample_input` hands out no per-caller handle to scope
-    /// it to, so independent unique sampling still requires going through [`Self::reader`].
-    returned: RefCell<HashSet<u64>>,
     rng: Rc<RefCell<Pcg32>>,
 }
 
@@ -49,7 +45,6 @@ impl SimpleEventRunLog {
             inputs: Rc::new(RefCell::new(Vec::new())),
             outputs: vec![],
             metadata: vec![],
-            returned: RefCell::new(HashSet::new()),
             rng: Rc::new(RefCell::new(
                 Seeder::from(&format!("{seed}-run_log")).into_rng(),
             )),
@@ -73,6 +68,8 @@ impl RunLog for SimpleEventRunLog {
     fn get_signal(&self, _signal: spec::Signal) -> Option<serde_json::Value> {
         None
     }
+
+    fn push_signal_outcome(&mut self, _key: &str, _outcome: &crate::signal::SignalOutcome) {}
 
     fn reader(&self) -> Rc<dyn RunLogReader> {
         Rc::new(SimpleEventRunLogReader {

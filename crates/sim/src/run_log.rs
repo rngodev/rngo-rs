@@ -3,6 +3,7 @@ mod sqlite;
 
 use crate::effect::Input;
 use crate::schema::Metadata;
+use crate::signal::SignalOutcome;
 use crate::{Output, spec};
 use serde_json::Value;
 use std::rc::Rc;
@@ -15,6 +16,7 @@ pub trait RunLog: std::fmt::Debug {
     fn push_output(&mut self, output: Output);
     fn push_metadata(&mut self, metadata: EffectMetadata);
     fn get_signal(&self, signal: spec::Signal) -> Option<Value>;
+    fn push_signal_outcome(&mut self, key: &str, outcome: &SignalOutcome);
     fn reader(&self) -> Rc<dyn RunLogReader>;
 }
 

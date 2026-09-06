@@ -1,5 +1,6 @@
 use chrono::{DateTime, FixedOffset};
 use console::{Term, style};
+use rngo_sim::signal::SignalOutcome;
 use rngo_sim::{EffectMetadata, Input, Output, RunLog, RunLogReader, spec};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -112,6 +113,10 @@ impl RunLog for StatusRunLog {
 
     fn get_signal(&self, signal: spec::Signal) -> Option<serde_json::Value> {
         self.child.get_signal(signal)
+    }
+
+    fn push_signal_outcome(&mut self, key: &str, outcome: &SignalOutcome) {
+        self.child.push_signal_outcome(key, outcome);
     }
 
     fn reader(&self) -> Rc<dyn RunLogReader> {

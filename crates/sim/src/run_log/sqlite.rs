@@ -2,7 +2,7 @@ use crate::effect::Input;
 use crate::output::Level;
 use crate::run_log::{Cursor, EffectMetadata, RunLogIndex, RunLogIndexConfig, RunLogReader};
 use crate::schema::Metadata;
-use crate::signal::sql_value_to_json;
+use crate::signal::{SignalOutcome, sql_value_to_json};
 use crate::util::json_pointer::JsonPointer;
 use crate::{Output, RunLog, spec};
 use chrono::{DateTime, Utc};
@@ -199,6 +199,48 @@ impl RunLog for SqliteRunLog {
             .query_row(&query, [], |row| row.get::<_, rusqlite::types::Value>(0))
             .ok()
             .and_then(sql_value_to_json)
+    }
+
+    /// Persists one signal's outcome to the `signals` table, so it's queryable from the run's
+    /// `log.sqlite` file after the fact (e.g. by `cli/src/run.rs`'s tests) - `signal.rs` computes
+    /// the outcome itself via `get_signal` and is backend-agnostic, so this table write is the
+    /// Sqlite-specific counterpart.
+    fn push_signal_outcome(&mut self, key: &str, outcome: &SignalOutcome) {
+        let connection = self.connection.borrow();
+
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS signals (
+                    key TEXT NOT NULL,
+                    value TEXT,
+                    result TEXT,
+                    error TEXT
+                )",
+            )
+            .unwrap();
+
+        let result = match (&outcome.error, outcome.passed) {
+            (Some(_), _) => Some("error"),
+            (None, Some(true)) => Some("passed"),
+            (None, Some(false)) => Some("failed"),
+            (None, None) => None,
+        };
+
+        connection
+            .prepare_cached(
+                "INSERT INTO signals (key, value, result, error) VALUES (?1, ?2, ?3, ?4)",
+            )
+            .unwrap()
+            .execute(rusqlite::params![
+                key,
+                outcome.value.as_ref().map(|v| v.to_string()),
+                result,
+                &outcome.error,
+            ])
+            .unwrap();
+
+        drop(connection);
+        self.record();
     }
 
     fn reader(&self) -> Rc<dyn RunLogReader> {
@@ -831,5 +873,34 @@ mod tests {
         });
 
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn push_signal_outcome_persists_to_signals_table() {
+        let tmp = TempDir::new().unwrap();
+        let mut run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
+
+        run_log.push_signal_outcome(
+            "check",
+            &SignalOutcome {
+                value: Some(serde_json::json!(3)),
+                passed: Some(true),
+                error: None,
+            },
+        );
+        run_log.commit();
+
+        let conn = open(tmp.path());
+        let (value, result, error): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT value, result, error FROM signals WHERE key = 'check'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(value, "3");
+        assert_eq!(result, "passed");
+        assert_eq!(error, None);
     }
 }

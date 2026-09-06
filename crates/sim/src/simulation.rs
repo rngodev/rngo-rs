@@ -33,22 +33,20 @@ impl Iterator for Simulation {
             return None;
         }
 
-        loop {
-            self.effects
-                .sort_unstable_by_key(|e| e.next_offset().unwrap_or(u64::MAX));
+        self.effects
+            .sort_unstable_by_key(|e| e.next_offset().unwrap_or(u64::MAX));
 
-            match self.effects.first_mut()?.next()? {
-                Ok(input) => {
-                    self.emitted += 1;
-                    return Some(SimulationEvent::Input(input));
+        match self.effects.first_mut()?.next()? {
+            Ok(input) => {
+                self.emitted += 1;
+                Some(SimulationEvent::Input(input))
+            }
+            Err(skipped_input) => {
+                self.emitted += 1;
+                if self.limit.is_some_and(|limit| self.emitted >= limit) {
+                    return None;
                 }
-                Err(skipped_input) => {
-                    self.emitted += 1;
-                    if self.limit.is_some_and(|limit| self.emitted >= limit) {
-                        return None;
-                    }
-                    Some(SimulationEvent::SkippedInput(skipped_input));
-                }
+                Some(SimulationEvent::SkippedInput(skipped_input))
             }
         }
     }
