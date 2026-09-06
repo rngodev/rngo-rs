@@ -1,12 +1,12 @@
 use rngo_sim::build::*;
-use rngo_sim::{Simulation, SqliteRunLog};
+use rngo_sim::{RunLog, SimpleEventRunLog, Simulation, SimulationEvent, SqliteRunLog};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
 #[test]
 fn reference_with_no_prior_events_is_skipped_not_logged() {
     let tmp = TempDir::new().unwrap();
-    let run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
+    let mut run_log = SqliteRunLog::new(tmp.path().to_path_buf(), 1);
 
     let mut simulation_builder = Simulation::builder();
     simulation_builder.with_effect("derived", |e| {
@@ -15,19 +15,37 @@ fn reference_with_no_prior_events_is_skipped_not_logged() {
     });
 
     let simulation = simulation_builder
-        .run_log(run_log)
+        .run_log_reader(run_log.reader())
         .limit(5)
         .build()
         .unwrap();
-    let events: Vec<_> = simulation.collect();
 
-    assert!(
-        events.is_empty(),
+    // Simulation no longer writes to a run log itself - that's the caller's job, mirroring
+    // cli/src/run.rs: push a real input, or the skipped occurrence's metadata, as each arrives.
+    let mut input_count = 0;
+    for event in simulation {
+        match event {
+            SimulationEvent::Input(input) => {
+                input_count += 1;
+                run_log.push_input(input);
+            }
+            SimulationEvent::SkippedInput(skipped) => {
+                run_log.push_metadata(skipped.into());
+            }
+        }
+    }
+
+    assert_eq!(
+        input_count, 0,
         "reference to an effect with no events should never yield a value"
     );
 
+    // Dropping the run log commits its pending transaction (see `SqliteRunLog`'s `Drop` impl),
+    // so its writes are visible to a fresh connection opened on the same file.
+    drop(run_log);
+
     let conn = Connection::open(tmp.path().join("log.sqlite")).unwrap();
-    let input_count: i64 = conn
+    let input_row_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM inputs", [], |row| row.get(0))
         .unwrap();
     let metadata_count: i64 = conn
@@ -35,7 +53,7 @@ fn reference_with_no_prior_events_is_skipped_not_logged() {
         .unwrap();
 
     assert_eq!(
-        input_count, 0,
+        input_row_count, 0,
         "skipped occurrences must not be logged as inputs"
     );
     assert!(
@@ -46,6 +64,8 @@ fn reference_with_no_prior_events_is_skipped_not_logged() {
 
 #[test]
 fn object_with_a_skipped_property_is_itself_skipped() {
+    let run_log = SimpleEventRunLog::new(1);
+
     let mut simulation_builder = Simulation::builder();
     simulation_builder.with_effect("derived", |e| {
         e.trigger_hertz(1.0).schema(
@@ -55,8 +75,18 @@ fn object_with_a_skipped_property_is_itself_skipped() {
         )
     });
 
-    let simulation = simulation_builder.build().unwrap();
-    let events: Vec<_> = simulation.take(5).collect();
+    let simulation = simulation_builder
+        .run_log_reader(run_log.reader())
+        .build()
+        .unwrap();
+
+    let events: Vec<_> = simulation
+        .take(5)
+        .filter_map(|event| match event {
+            SimulationEvent::Input(input) => Some(input),
+            SimulationEvent::SkippedInput(_) => None,
+        })
+        .collect();
 
     assert!(
         events.is_empty(),
@@ -66,6 +96,8 @@ fn object_with_a_skipped_property_is_itself_skipped() {
 
 #[test]
 fn array_with_a_skipped_item_is_itself_skipped() {
+    let run_log = SimpleEventRunLog::new(1);
+
     let mut simulation_builder = Simulation::builder();
     simulation_builder.with_effect("derived", |e| {
         e.trigger_hertz(1.0).schema(
@@ -76,8 +108,18 @@ fn array_with_a_skipped_item_is_itself_skipped() {
         )
     });
 
-    let simulation = simulation_builder.build().unwrap();
-    let events: Vec<_> = simulation.take(5).collect();
+    let simulation = simulation_builder
+        .run_log_reader(run_log.reader())
+        .build()
+        .unwrap();
+
+    let events: Vec<_> = simulation
+        .take(5)
+        .filter_map(|event| match event {
+            SimulationEvent::Input(input) => Some(input),
+            SimulationEvent::SkippedInput(_) => None,
+        })
+        .collect();
 
     assert!(
         events.is_empty(),

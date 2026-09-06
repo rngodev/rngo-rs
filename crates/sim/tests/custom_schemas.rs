@@ -1,7 +1,7 @@
 mod common;
 
 use common::ParseErrorTestExt;
-use rngo_sim::{Dialect, ParseError, Simulation};
+use rngo_sim::{Dialect, ParseError, Simulation, SimulationEvent};
 use std::fmt;
 
 fn build(json: &str) -> Result<Simulation, String> {
@@ -64,7 +64,13 @@ fn resolves_custom_schema_independently_per_effect() {
     }"#;
 
     let simulation = build(json).unwrap();
-    let events: Vec<_> = simulation.take(20).collect();
+    let events: Vec<_> = simulation
+        .filter_map(|event| match event {
+            SimulationEvent::Input(input) => Some(input),
+            SimulationEvent::SkippedInput(_) => None,
+        })
+        .take(20)
+        .collect();
 
     assert!(events.iter().any(|e| e.effect == "a"));
     assert!(events.iter().any(|e| e.effect == "b"));
@@ -97,7 +103,13 @@ fn custom_schema_can_reference_another_custom_schema() {
     }"#;
 
     let simulation = build(json).unwrap();
-    let events: Vec<_> = simulation.take(1).collect();
+    let events: Vec<_> = simulation
+        .filter_map(|event| match event {
+            SimulationEvent::Input(input) => Some(input),
+            SimulationEvent::SkippedInput(_) => None,
+        })
+        .take(1)
+        .collect();
     assert_eq!(events[0].data, serde_json::json!("x"));
 }
 

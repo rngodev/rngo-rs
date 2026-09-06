@@ -86,7 +86,6 @@ pub struct SchemaEdge {
 pub enum SimulationKey {
     Start,
     End,
-    RunLog,
 }
 
 #[derive(Debug)]

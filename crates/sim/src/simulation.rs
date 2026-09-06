@@ -1,7 +1,8 @@
-use crate::RunLogReader;
 use crate::build::{BuildError, SimulationKey};
 use crate::effect::{Effect, EffectBuilder, Input, SkippedInput};
+use crate::run_log::SimpleEventRunLog;
 use crate::util::time::Moment;
+use crate::{RunLog, RunLogReader};
 use chrono::{TimeDelta, Utc};
 use serde::Serialize;
 use std::rc::Rc;
@@ -144,17 +145,9 @@ impl SimulationBuilder {
             });
         }
 
-        let run_log_reader = match self.run_log_reader {
-            Some(run_log_reader) => run_log_reader,
-            None => {
-                errors.push(BuildError::Simulation {
-                    key: SimulationKey::RunLog,
-                    message: "start must be before end".into(),
-                });
-
-                return Err(errors);
-            }
-        };
+        let run_log_reader = self
+            .run_log_reader
+            .unwrap_or_else(|| SimpleEventRunLog::new(self.seed).reader());
 
         let mut effects = vec![];
 
@@ -186,6 +179,7 @@ impl SimulationBuilder {
 
 #[cfg(test)]
 mod tests {
+    use super::SimulationEvent;
     use crate::build::BuildError;
     use crate::schema::{
         Metadata, Schema, SchemaBuildVisitor, SchemaBuilder, SchemaContext, SchemaResult,
@@ -239,11 +233,23 @@ mod tests {
 
         let events: Vec<_> = simulation_builder.limit(5).build().unwrap().collect();
 
-        // 5 emitted total (limit), alternating Ok, Err, Ok, Err, Ok - so 3 are yielded.
+        // 5 emitted total (limit) - every attempt is yielded now, whether it succeeded or was
+        // skipped, so the cap shows up directly in the total count.
         assert_eq!(
             events.len(),
-            3,
+            5,
             "limit should count both effect and error events toward the cap"
+        );
+
+        // Alternating Ok, Err, Ok, Err, Ok - so 3 of the 5 are real inputs, confirming the errors
+        // above weren't free retries that let more than 3 successes slip in under the same cap.
+        let input_count = events
+            .iter()
+            .filter(|e| matches!(e, SimulationEvent::Input(_)))
+            .count();
+        assert_eq!(
+            input_count, 3,
+            "alternating Ok/Err schema should produce 3 real inputs among the 5 attempts"
         );
     }
 }

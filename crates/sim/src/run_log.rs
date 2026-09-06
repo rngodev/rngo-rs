@@ -1,7 +1,7 @@
 mod simple;
 mod sqlite;
 
-use crate::effect::Input;
+use crate::effect::{Input, SkippedInput};
 use crate::schema::Metadata;
 use crate::signal::SignalOutcome;
 use crate::{Output, spec};
@@ -47,4 +47,17 @@ pub struct EffectMetadata {
     effect: String,
     offset: u64,
     metadata: Vec<Metadata>,
+}
+
+/// A skipped occurrence never produces a stored input, so its metadata is always logged with no
+/// `input_id` to attach to.
+impl From<SkippedInput> for EffectMetadata {
+    fn from(skipped: SkippedInput) -> Self {
+        EffectMetadata {
+            input_id: None,
+            effect: skipped.effect,
+            offset: skipped.offset,
+            metadata: skipped.metadata,
+        }
+    }
 }
