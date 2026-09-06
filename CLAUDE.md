@@ -39,13 +39,13 @@ The workspace has two crates:
 
 4. **Effect** (`effect.rs`): Also an iterator, yielding `Result<Input, SkippedInput>`. Driven by a `Trigger` (either a `Clock` for time-based firing or another `Effect` for dependency-based firing) and a `Schema` for generating values. `Input` (`{ id, effect, offset, timestamp, data, metadata }`) is the event an effect produces each time it fires.
 
-### CLI run loop (`cli/src/sim/run.rs`)
+### CLI run loop (`cli/src/run/exec.rs`)
 
 - Loads spec, creates a run directory at `.rngo/runs/<UUID>/`, writes `spec.json` snapshot and initializes a `log.sqlite` SQLite database.
 - Without `--stdout`: writes each `Input` to the `inputs` table in the SQLite database and dispatches to any assigned channel via `ChannelDispatch`.
 - With `--stdout`: serializes all input events to stdout.
 
-### Channel targets (`cli/src/sim/channel.rs`)
+### Channel targets (`cli/src/run/channel.rs`)
 
 `ChannelDispatch` implements two integration modes for `channels`:
 - `stream`: spawns one long-lived subprocess per channel, writes formatted event lines to its stdin.

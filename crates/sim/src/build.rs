@@ -63,6 +63,17 @@ pub enum BuildError {
         path: Vec<SchemaEdge>,
         message: String,
     },
+    System {
+        message: String,
+    },
+    Channel {
+        channel: String,
+        message: String,
+    },
+    ChannelTarget {
+        channel: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]

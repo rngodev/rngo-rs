@@ -1,7 +1,8 @@
-use crate::sim::channel::ChannelDispatch;
-use crate::sim::status::StatusRunLog;
+mod status;
+
 use console::style;
-use rngo_sim::{Dialect, SqliteRunLog, spec};
+use rngo_sim::{Dialect, RunLog, SimulationEvent, SqliteRunLog, signal, spec};
+use status::StatusRunLog;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -22,9 +23,9 @@ pub fn run(
         None => load_spec(base)?,
     };
 
-    let mut simulation_builder = Dialect::primitive()
-        .parse_simulation(spec.clone())
-        .map_err(join_errors)?;
+    let dialect = Dialect::primitive();
+
+    let mut simulation_builder = dialect.parse_spec(spec.clone()).map_err(join_errors)?;
 
     if let Some(limit) = limit {
         simulation_builder = simulation_builder.limit(limit.get());
@@ -48,38 +49,60 @@ pub fn run(
         .iter()
         .filter_map(|(k, v)| v.channel.as_ref().map(|s| (k.clone(), s.clone())))
         .collect();
-    let run_log = StatusRunLog::new(
+
+    let mut run_log = StatusRunLog::new(
         Box::new(SqliteRunLog::new(run_dir.clone(), simulation_builder.seed)),
         effect_channels,
     );
 
     let mut simulation = simulation_builder
-        .run_log(run_log)
+        .run_log_reader(run_log.reader())
         .build()
         .map_err(join_errors)?;
-    let channels = simulation.take_channels();
-    let mut channel_dispatch = ChannelDispatch::new(&spec, channels, simulation.output_tx())?;
 
-    for input_event in &mut simulation {
+    let system_builder = dialect.parse_system(spec.clone()).map_err(join_errors)?;
+
+    let mut system = system_builder.build().map_err(join_errors)?;
+
+    for event in &mut simulation {
         if stdout {
-            println!("{}", serde_json::to_string(&input_event)?);
+            println!("{}", serde_json::to_string(&event)?);
         } else {
-            channel_dispatch.send(&input_event)?;
+            match event {
+                SimulationEvent::Input(input) => {
+                    let outputs = system.send(&input)?;
+                    run_log.push_input(input);
+                    for output in outputs {
+                        run_log.push_output(output);
+                    }
+                }
+                SimulationEvent::SkippedInput(_skipped_input) => todo!(),
+            }
+        }
+
+        // `system` buffers ambient output (e.g. a `stream` channel's subprocess writing to
+        // stdout on its own schedule) in an unbounded channel behind the scenes - drain it every
+        // time we pull an event from `simulation` rather than only once at the end, so it can't
+        // build up across a long run. `System::next` is a non-blocking poll (`try_recv`), so this
+        // never waits on anything; it just keeps the buffer near-empty.
+        for output in &mut system {
+            run_log.push_output(output);
         }
     }
 
     // Closes stdin on every stream channel (triggering exit for those that react to EOF) and
     // kills any stragglers - including output-source channels with no natural end - after a
-    // grace period; `simulation.finish()` drains the trailing outputs this produces and drops
-    // the simulation, committing the run log before signals are evaluated below.
-    channel_dispatch.finish()?;
-    simulation.finish();
+    // grace period. This can itself produce trailing output (e.g. a subprocess flushing once it
+    // gets EOF) after the last drain above, so drain once more before signals evaluate the log.
+    system.finish();
+    for output in &mut system {
+        run_log.push_output(output);
+    }
 
     let mut all_passed = true;
 
     if !spec.signals.is_empty() {
-        let outcomes =
-            rngo_sim::signal::evaluate_from_log(&run_dir.join("log.sqlite"), &spec.signals)?;
+        let outcomes = signal::evaluate(&mut run_log, &spec.signals);
 
         println!();
         println!("{}", style("Audit").bold());
@@ -124,12 +147,12 @@ pub fn run(
     Ok(all_passed)
 }
 
-fn load_spec_file(path: &Path) -> Result<spec::Simulation, Box<dyn Error>> {
+fn load_spec_file(path: &Path) -> Result<spec::Spec, Box<dyn Error>> {
     let value: serde_json::Value = serde_yaml::from_str(&fs::read_to_string(path)?)?;
     Ok(spec::from_value(value).map_err(join_errors)?)
 }
 
-fn load_spec(base: &Path) -> Result<spec::Simulation, Box<dyn Error>> {
+fn load_spec(base: &Path) -> Result<spec::Spec, Box<dyn Error>> {
     let spec_path = base.join(".rngo/spec.yml");
 
     let mut spec: serde_json::Value = if spec_path.exists() {

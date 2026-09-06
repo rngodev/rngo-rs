@@ -1222,6 +1222,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "handlebars",
+ "indexmap",
  "rngo-sim",
  "rusqlite",
  "semver",
@@ -1239,6 +1240,7 @@ version = "0.35.0"
 dependencies = [
  "cel",
  "chrono",
+ "handlebars",
  "indexmap",
  "multi_try",
  "pastey",

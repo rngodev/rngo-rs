@@ -6,6 +6,6 @@ pub trait FormatParser {
     fn parse(
         &self,
         format: &spec::Format,
-        simulation: &spec::Simulation,
+        spec: &spec::Spec,
     ) -> Result<Box<dyn Format>, Vec<ParseError>>;
 }

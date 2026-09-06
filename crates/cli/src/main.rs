@@ -1,5 +1,5 @@
 mod init;
-mod sim;
+mod run;
 mod skills;
 mod ui;
 
@@ -87,7 +87,7 @@ fn main() {
             limit,
             dir,
             spec,
-        } => match sim::run(&dir, stdout, spec.as_deref(), dry_run, limit) {
+        } => match run::run(&dir, stdout, spec.as_deref(), dry_run, limit) {
             Ok(true) => {}
             Ok(false) => std::process::exit(1),
             Err(e) => {

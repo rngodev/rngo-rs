@@ -1,28 +1,34 @@
 use super::format::FormatParser;
 use super::schema::{SchemaParseVisitor, SchemaParser};
-use crate::channel::Channel;
+use crate::channel::{self, Channel, ChannelTargetBuilder};
 use crate::effect::Effect;
 use crate::format::Format;
+use crate::parse::ChannelTargetParser;
 use crate::schema::custom::CustomParser;
 use crate::simulation::{Simulation, SimulationBuilder};
-use crate::spec::{self, ParseError};
+use crate::spec::{self, ParseError, Spec};
+use crate::system::{System, SystemBuilder};
 use crate::util::time::Moment;
 use crate::{format, schema};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub struct Dialect {
     schema_parsers: Rc<Vec<Box<dyn SchemaParser>>>,
     format_parsers: Rc<Vec<Box<dyn FormatParser>>>,
+    channel_target_parsers: Rc<Vec<Box<dyn ChannelTargetParser>>>,
 }
 
 impl Dialect {
     pub fn new(
         schema_parsers: Vec<Box<dyn SchemaParser>>,
         format_parsers: Vec<Box<dyn FormatParser>>,
+        channel_target_parsers: Vec<Box<dyn ChannelTargetParser>>,
     ) -> Self {
         Dialect {
             schema_parsers: Rc::new(schema_parsers),
             format_parsers: Rc::new(format_parsers),
+            channel_target_parsers: Rc::new(channel_target_parsers),
         }
     }
 
@@ -40,6 +46,10 @@ impl Dialect {
                 Box::new(schema::Str::parser()),
             ],
             vec![Box::new(format::SqlFormat::parser())],
+            vec![
+                Box::new(channel::Exec::parser()),
+                Box::new(channel::Stream::parser()),
+            ],
         )
     }
 
@@ -47,38 +57,11 @@ impl Dialect {
         &self,
         value: serde_json::Value,
     ) -> Result<SimulationBuilder, Vec<ParseError>> {
-        let spec: spec::Simulation = spec::from_value(value)?;
-        self.parse_simulation(spec)
+        let spec: Spec = spec::from_value(value)?;
+        self.parse_spec(spec)
     }
 
-    /// Resolves a channel's `format` config to a runtime [`Format`] instance. Returns `Ok(None)`
-    /// when no registered parser recognizes the format's type, matching the historical behavior
-    /// of silently not formatting rather than erroring on an unrecognized/absent type.
-    fn parse_format(
-        &self,
-        format: &spec::Format,
-        simulation: &spec::Simulation,
-    ) -> Result<Option<Box<dyn Format>>, Vec<ParseError>> {
-        let matching: Vec<_> = self
-            .format_parsers
-            .iter()
-            .filter(|p| format.ftype.as_deref() == Some(p.key()))
-            .collect();
-
-        match matching.as_slice() {
-            [parser] => parser.parse(format, simulation).map(Some),
-            [] => Ok(None),
-            _ => Err(vec![ParseError::SchemaError {
-                path: None,
-                message: format!("{} format parsers matched", matching.len()),
-            }]),
-        }
-    }
-
-    pub fn parse_simulation(
-        &self,
-        spec: spec::Simulation,
-    ) -> Result<SimulationBuilder, Vec<ParseError>> {
+    pub fn parse_spec(&self, spec: Spec) -> Result<SimulationBuilder, Vec<ParseError>> {
         let mut errors = vec![];
         let mut simulation_builder = Simulation::builder();
         let simulation_moment_parser = Moment::parser();
@@ -177,29 +160,115 @@ impl Dialect {
             }
         }
 
+        if !errors.is_empty() {
+            Err(errors)
+        } else {
+            Ok(simulation_builder)
+        }
+    }
+
+    pub fn parse_system(&self, spec: Spec) -> Result<SystemBuilder, Vec<ParseError>> {
+        let mut errors = vec![];
+        let mut simulation_builder = System::builder();
+
+        let effect_channels: HashMap<String, String> = spec
+            .effects
+            .iter()
+            .filter_map(|(k, v)| v.channel.as_ref().map(|s| (k.clone(), s.clone())))
+            .collect();
+
+        for (effect_key, channel_key) in &effect_channels {
+            if !spec.channels.keys().any(|key| key == channel_key) {
+                errors.push(ParseError::SchemaError {
+                    path: Some(vec!["effects".into(), effect_key.clone(), "channel".into()]),
+                    message: format!("unknown channel: {channel_key}"),
+                });
+            }
+        }
+
         for (key, channel) in &spec.channels {
-            let format = match &channel.format {
-                Some(format) => match self.parse_format(format, &spec) {
-                    Ok(format) => format,
-                    Err(mut e) => {
-                        errors.append(&mut e);
-                        None
+            let mut channel_builder = Channel::builder(key.clone());
+
+            match &channel.format {
+                Some(format) if format.ftype.is_some() => match self.parse_format(format, &spec) {
+                    Ok(format) => {
+                        channel_builder.set_format(format);
                     }
+                    Err(mut e) => errors.append(&mut e),
                 },
-                None => None,
+                _ => (),
             };
 
-            simulation_builder.set_channel(Channel {
-                key: key.clone(),
-                format,
-                target: channel.target.clone(),
-            });
+            match self.parse_target(key, &channel.target) {
+                Ok(target_builder) => {
+                    channel_builder.set_target(target_builder);
+                }
+                Err(mut e) => errors.append(&mut e),
+            }
+
+            let effects = effect_channels
+                .iter()
+                .filter(|(_, channel_key)| *channel_key == key)
+                .map(|(effect_key, _)| effect_key.clone())
+                .collect();
+
+            channel_builder.set_effects(effects);
+
+            simulation_builder.set_channel(channel_builder);
         }
 
         if !errors.is_empty() {
             Err(errors)
         } else {
             Ok(simulation_builder)
+        }
+    }
+
+    fn parse_format(
+        &self,
+        format: &spec::Format,
+        simulation: &Spec,
+    ) -> Result<Box<dyn Format>, Vec<ParseError>> {
+        let matching: Vec<_> = self
+            .format_parsers
+            .iter()
+            .filter(|p| format.ftype.as_deref() == Some(p.key()))
+            .collect();
+
+        match matching.as_slice() {
+            [parser] => parser.parse(format, simulation),
+            [] => Err(vec![ParseError::SchemaError {
+                path: None,
+                message: "unknown format type".to_string(),
+            }]),
+            _ => Err(vec![ParseError::SchemaError {
+                path: None,
+                message: format!("{} format parsers matched", matching.len()),
+            }]),
+        }
+    }
+
+    fn parse_target(
+        &self,
+        channel_key: &str,
+        channel_target: &spec::ChannelTarget,
+    ) -> Result<Box<dyn ChannelTargetBuilder>, Vec<ParseError>> {
+        let matching: Vec<_> = self
+            .channel_target_parsers
+            .iter()
+            .filter(|p| channel_target.ttype.as_deref() == Some(p.key()))
+            .collect();
+
+        match matching.as_slice() {
+            [parser] => parser.parse(channel_key.into(), channel_target),
+            [] => Err(vec![ParseError::SchemaError {
+                path: None,
+                message: "unknown target type".to_string(),
+            }]),
+            _ => Err(vec![ParseError::SchemaError {
+                path: None,
+                message: format!("{} target parsers matched", matching.len()),
+            }]),
         }
     }
 }
